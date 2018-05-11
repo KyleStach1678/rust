@@ -11,13 +11,8 @@
 #![allow(warnings)]
 
 use std::mem;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use rustc_data_structures::sync::{Lock, LockGuard, Lrc, Weak};
 use rustc_data_structures::OnDrop;
-use rayon_core::registry::{self, Registry, WorkerThread};
-use rayon_core::fiber::{Fiber, Waitable, WaiterLatch};
-use rayon_core::latch::{LatchProbe, Latch};
 use syntax_pos::Span;
 use ty::tls;
 use ty::maps::Query;
@@ -26,10 +21,12 @@ use ty::context::TyCtxt;
 use errors::Diagnostic;
 use std::process;
 use std::fmt;
-use std::sync::{Arc, Mutex};
 use std::collections::HashSet;
 #[cfg(parallel_queries)]
 use {
+    parking_lot::{Mutex, Condvar},
+    std::sync::atomic::Ordering,
+    std::thread,
     std::iter,
     std::iter::FromIterator,
     syntax_pos::DUMMY_SP,
@@ -63,7 +60,7 @@ pub struct QueryJob<'tcx> {
     /// Diagnostic messages which are emitted while the query executes
     pub diagnostics: Lock<Vec<Diagnostic>>,
 
-    latch: Lock<QueryLatch>,
+    latch: QueryLatch,
 }
 
 impl<'tcx> QueryJob<'tcx> {
@@ -73,7 +70,7 @@ impl<'tcx> QueryJob<'tcx> {
             diagnostics: Lock::new(Vec::new()),
             info,
             parent,
-            latch: Lock::new(QueryLatch::new()),
+            latch: QueryLatch::new(),
         }
     }
 
@@ -94,24 +91,15 @@ impl<'tcx> QueryJob<'tcx> {
         #[cfg(parallel_queries)]
         {
             tls::with_related_context(tcx, move |icx| {
-                let cycle = (span, Lock::new(None));
+                let mut waiter = QueryWaiter {
+                    query: &icx.query,
+                    span,
+                    cycle: None,
+                    condvar: Condvar::new(),
+                };
+                self.latch.await(tcx, &mut waiter);
 
-                {
-                    let icx = tls::ImplicitCtxt {
-                        waiter_cycle: Some(&cycle),
-                        ..icx.clone()
-                    };
-
-                    tls::enter_context(&icx, |_| {
-                        registry::in_worker(|worker, _| {
-                            unsafe {
-                                worker.wait_enqueue(self);
-                            }
-                        });
-                    })
-                }
-
-                match cycle.1.into_inner() {
+                match waiter.cycle {
                     None => Ok(()),
                     Some(cycle) => Err(cycle)
                 }
@@ -155,114 +143,105 @@ impl<'tcx> QueryJob<'tcx> {
     ///
     /// This does nothing for single threaded rustc,
     /// as there are no concurrent jobs which could be waiting on us
-    pub fn signal_complete(&self) {
+    pub fn signal_complete(&self, tcx: TyCtxt<'_, 'tcx, '_>) {
         #[cfg(parallel_queries)]
-        self.latch.lock().set();
+        self.latch.set(tcx);
     }
 }
 
 #[cfg(parallel_queries)]
-impl<'tcx> LatchProbe for QueryJob<'tcx> {
-    #[inline]
-    fn probe(&self) -> bool {
-        self.latch.lock().complete
+struct QueryWaiter<'a, 'tcx: 'a> {
+    query: &'a Option<Lrc<QueryJob<'tcx>>>,
+    condvar: Condvar,
+    span: Span,
+    cycle: Option<CycleError<'tcx>>,
+}
+
+#[cfg(parallel_queries)]
+impl<'a, 'tcx> QueryWaiter<'a, 'tcx> {
+    fn notify(&self, tcx: TyCtxt<'_, '_, '_>) {
+        tcx.active_threads.fetch_add(1, Ordering::SeqCst);
+        self.condvar.notify_one();
     }
 }
 
 #[cfg(parallel_queries)]
-impl<'tcx> Latch for QueryJob<'tcx> {
-    fn set(&self) {
-        self.latch.lock().set();
-    }
-}
-
-#[cfg(parallel_queries)]
-impl<'tcx> Waitable for QueryJob<'tcx> {
-    fn complete(&self, _worker_thread: &WorkerThread) -> bool {
-        self.probe()
-    }
-
-    fn await(&self, worker_thread: &WorkerThread, waiter: Fiber, tlv: usize) {
-        let mut latch = self.latch.lock();
-        if latch.complete {
-            worker_thread.registry.resume_fiber(worker_thread.index(), waiter);
-        } else {
-            latch.waiters.push(QueryWaiter {
-                worker_index: worker_thread.index(),
-                fiber: waiter,
-                tlv,
-            });
-        }
-    }
-}
-
-#[cfg(parallel_queries)]
-struct QueryWaiter {
-    worker_index: usize,
-    fiber: Fiber,
-    tlv: usize,
-}
-
-#[cfg(parallel_queries)]
-impl QueryWaiter {
-    fn icx<'a, 'b, 'gcx, 'tcx>(&'a self) -> *const tls::ImplicitCtxt<'b, 'gcx, 'tcx> {
-        self.tlv as *const tls::ImplicitCtxt
-    }
+struct QueryLatchInfo {
+    complete: bool,
+    waiters: Vec<&'static mut QueryWaiter<'static, 'static>>,
 }
 
 #[cfg(parallel_queries)]
 struct QueryLatch {
-    complete: bool,
-    waiters: Vec<QueryWaiter>,
+    info: Mutex<QueryLatchInfo>,
 }
 
 #[cfg(parallel_queries)]
 impl QueryLatch {
     fn new() -> Self {
         QueryLatch {
-            complete: false,
-            waiters: Vec::new(),
+            info: Mutex::new(QueryLatchInfo {
+                complete: false,
+                waiters: Vec::new(),
+            }),
         }
     }
 
-    fn set(&mut self) {
-        debug_assert!(!self.complete);
-        self.complete = true;
-        if !self.waiters.is_empty() {
-            let registry = Registry::current();
-            for waiter in self.waiters.drain(..) {
-                registry.resume_fiber(waiter.worker_index, waiter.fiber);
+    fn await(&self, tcx: TyCtxt<'_, '_, '_>, waiter: &mut QueryWaiter<'_, '_>) {
+        let mut info = self.info.lock();
+        if !info.complete {
+            let waiter = &*waiter;
+            unsafe {
+                #[allow(mutable_transmutes)]
+                info.waiters.push(mem::transmute(waiter));
             }
-            registry.signal();
+            if tcx.active_threads.fetch_sub(1, Ordering::SeqCst) == 1 {
+                // We are the last active thread, waiting here would cause a deadlock.
+                // Spawn a thread to handle the deadlock before we go to sleep
+                handle_deadlock(tcx);
+            }
+            waiter.condvar.wait(&mut info);
         }
     }
 
-    fn resume_waiter(&mut self, waiter: usize, error: CycleError) {
-        debug_assert!(!self.complete);
+    fn set(&self, tcx: TyCtxt<'_, '_, '_>) {
+        let mut info = self.info.lock();
+        debug_assert!(!info.complete);
+        info.complete = true;
+        for waiter in info.waiters.drain(..) {
+            waiter.notify(tcx);
+        }
+    }
+
+    fn resume_waiter(
+        &self,
+        waiter: usize,
+        error: CycleError
+    ) -> &'static mut QueryWaiter<'static, 'static> {
+        let mut info = self.info.lock();
+        debug_assert!(!info.complete);
         // Remove the waiter from the list of waiters
-        let waiter = self.waiters.remove(waiter);
+        let waiter = info.waiters.remove(waiter);
 
-        // Set the cycle error in its icx so it can pick it up when resumed
-        {
-            let icx = unsafe { &*waiter.icx() };
-            *icx.waiter_cycle.unwrap().1.lock() = Some(error);
-        }
+        // Set the cycle error it will be picked it up when resumed
+        waiter.cycle = unsafe { Some(mem::transmute(error)) };
 
-        // Resume the waiter
-        let registry = Registry::current();
-        registry.resume_fiber(waiter.worker_index, waiter.fiber);
+        waiter
     }
 }
 
+#[cfg(parallel_queries)]
 fn print_job<'a, 'tcx, 'lcx>(tcx: TyCtxt<'a, 'tcx, 'lcx>, job: &QueryJob<'tcx>) -> String {
-    format!("[{}] {:x} {:?}",
-        0/*entry.id*/, job as *const _ as usize, job.info.query.describe(tcx))
+    format!("{:x} {:?}", job as *const _ as usize, job.info.query.describe(tcx))
 }
 
+#[cfg(parallel_queries)]
 type Ref<'tcx> = *const QueryJob<'tcx>;
 
+#[cfg(parallel_queries)]
 type Waiter<'tcx> = (Ref<'tcx>, usize);
 
+#[cfg(parallel_queries)]
 fn visit_waiters<'tcx, F>(query_ref: Ref<'tcx>, mut visit: F) -> Option<Option<Waiter<'tcx>>>
 where
     F: FnMut(Span, Ref<'tcx>) -> Option<Option<Waiter<'tcx>>>
@@ -274,11 +253,11 @@ where
             return Some(cycle);
         }
     }
-    for (i, waiter) in query.latch.lock().waiters.iter().enumerate() {
-        let icx = unsafe { &*waiter.icx() };
-        if let Some(ref waiter_query) = icx.query {
+    for (i, waiter) in query.latch.info.lock().waiters.iter().enumerate() {
+        //let icx = unsafe { &*waiter.icx() };
+        if let Some(ref waiter_query) = waiter.query {
             //eprintln!("visiting waiter {:?} of query {:?}", waiter, query_ref);
-            if visit(icx.waiter_cycle.unwrap().0, &**waiter_query as Ref).is_some() {
+            if visit(waiter.span, &**waiter_query as Ref).is_some() {
                 // We found a cycle, return this edge as the waiter
                 return Some(Some((query_ref, i)));
             }
@@ -287,6 +266,7 @@ where
     None
 }
 
+#[cfg(parallel_queries)]
 fn cycle_check<'tcx>(query: Ref<'tcx>,
                      span: Span,
                      stack: &mut Vec<(Span, Ref<'tcx>)>,
@@ -327,6 +307,7 @@ fn cycle_check<'tcx>(query: Ref<'tcx>,
     r
 }
 
+#[cfg(parallel_queries)]
 fn connected_to_root<'tcx>(query: Ref<'tcx>, visited: &mut HashSet<Ref<'tcx>>) -> bool {
     if visited.contains(&query) {
         return false;
@@ -349,11 +330,17 @@ fn connected_to_root<'tcx>(query: Ref<'tcx>, visited: &mut HashSet<Ref<'tcx>>) -
     }).is_some()
 }
 
+#[cfg(parallel_queries)]
 fn query_entry<'tcx>(r: Ref<'tcx>) -> QueryInfo<'tcx> {
     unsafe { (*r).info.clone() }
 }
 
-fn remove_cycle<'tcx>(jobs: &mut Vec<Ref<'tcx>>, tcx: TyCtxt<'_, 'tcx, '_>) {
+#[cfg(parallel_queries)]
+fn remove_cycle<'tcx>(
+    jobs: &mut Vec<Ref<'tcx>>,
+    wakelist: &mut Vec<&'static mut QueryWaiter<'static, 'static>>,
+    tcx: TyCtxt<'_, 'tcx, '_>
+) {
     let mut visited = HashSet::new();
     let mut stack = Vec::new();
     if let Some(waiter) = cycle_check(jobs.pop().unwrap(),
@@ -435,42 +422,75 @@ fn remove_cycle<'tcx>(jobs: &mut Vec<Ref<'tcx>>, tcx: TyCtxt<'_, 'tcx, '_>) {
             } ).collect(),
         };
 
-        waitee_query.latch.lock().resume_waiter(waiter_idx, error);
+        wakelist.push(waitee_query.latch.resume_waiter(waiter_idx, error));
     }
 }
 
-pub fn deadlock() {
+#[cfg(parallel_queries)]
+fn handle_deadlock(tcx: TyCtxt<'_, '_, '_>) {
+    use syntax;
+    use syntax_pos;
+
+    let syntax_globals = syntax::GLOBALS.with(|syntax_globals| {
+        syntax_globals as *const _
+    });
+    let syntax_globals = unsafe { &*syntax_globals };
+    let syntax_pos_globals = syntax_pos::GLOBALS.with(|syntax_pos_globals| {
+        syntax_pos_globals as *const _
+    });
+    let syntax_pos_globals = unsafe { &*syntax_pos_globals };
+    let tcx: TyCtxt<'static, 'static, 'static> = unsafe { mem::transmute(tcx) };
+    thread::spawn(move || {
+        syntax::GLOBALS.set(syntax_globals, || {
+            syntax_pos::GLOBALS.set(syntax_pos_globals, || {
+                tls::with_thread_locals(|| {
+                    tls::enter_global(&*tcx, |_| {
+                        deadlock(tcx)
+                    })
+                })
+            })
+        })
+    });
+}
+
+#[cfg(parallel_queries)]
+fn deadlock(tcx: TyCtxt<'_, '_, '_>) {
     let on_panic = OnDrop(|| {
         eprintln!("deadlock handler panicked, aborting process");
         process::abort();
     });
 
     //eprintln!("saw rayon deadlock");
-    unsafe { tls::with_global_query(|tcx| {
-        let mut jobs: Vec<_> = tcx.maps.collect_active_jobs().iter().map(|j| &**j as Ref).collect();
-/*
-        for job in &jobs { unsafe {
-            eprintln!("still active query: {}", print_job(tcx, &**job));
-            if let Some(ref parent) = (**job).parent {
-                eprintln!("   - has parent: {}", print_job(tcx, &**parent));
-            }
-            for (i, waiter) in (**job).latch.lock().waiters.iter().enumerate() {
-                let icx = &*waiter.icx();
-                if let Some(ref query) = icx.query {
-                    eprintln!("   - has waiter d{}: {}", i, print_job(tcx, &**query));
 
-                } else {
-                    eprintln!("   - has no-query waiter d{}", i);
-                }
-            }
-        } }
-*/
-        while jobs.len() > 0 {
-            remove_cycle(&mut jobs, tcx);
+    let mut wakelist = Vec::new();
+    let mut jobs: Vec<_> = tcx.maps.collect_active_jobs().iter().map(|j| &**j as Ref).collect();
+/*
+    for job in &jobs { unsafe {
+        eprintln!("still active query: {}", print_job(tcx, &**job));
+        if let Some(ref parent) = (**job).parent {
+            eprintln!("   - has parent: {}", print_job(tcx, &**parent));
         }
-    })};
+        for (i, waiter) in (**job).latch.lock().waiters.iter().enumerate() {
+            let icx = &*waiter.icx();
+            if let Some(ref query) = icx.query {
+                eprintln!("   - has waiter d{}: {}", i, print_job(tcx, &**query));
+
+            } else {
+                eprintln!("   - has no-query waiter d{}", i);
+            }
+        }
+    } }
+*/
+    while jobs.len() > 0 {
+        remove_cycle(&mut jobs, &mut wakelist, tcx);
+    }
+
+    // FIXME: Ensure this won't cause a deadlock before we return
+    for waiter in wakelist.into_iter() {
+        waiter.notify(tcx);
+    }
+
     //eprintln!("aborting due to deadlock");
     //process::abort();
     mem::forget(on_panic);
-    Registry::current().signal();
 }

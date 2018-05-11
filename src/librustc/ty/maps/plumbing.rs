@@ -17,7 +17,6 @@ use errors::DiagnosticBuilder;
 use errors::Level;
 use errors::Diagnostic;
 
-#[cfg(not(parallel_queries))]
 use errors::FatalError;
 use ty::tls;
 use ty::{TyCtxt};
@@ -30,21 +29,12 @@ use ty::item_path;
 use util::common::{profq_msg, ProfileQueriesMsg, QueryMsg};
 
 use rustc_data_structures::fx::{FxHashMap};
-use rustc_data_structures::sync::{Lrc, Lock};
+use rustc_data_structures::sync::Lrc;
 use std::mem;
 use std::ptr;
 use std::collections::hash_map::Entry;
 use syntax_pos::Span;
 use syntax::codemap::DUMMY_SP;
-
-#[cfg(parallel_queries)]
-use {
-    rayon_core,
-    std::panic,
-};
-
-#[cfg(not(parallel_queries))]
-use errors::FatalError;
 
 pub struct QueryMap<'tcx, D: QueryConfig<'tcx> + ?Sized> {
     pub(super) results: FxHashMap<D::Key, QueryValue<D::Value>>,
@@ -106,7 +96,7 @@ macro_rules! profq_query_msg {
 /// A type representing the responsibility to execute the job in the `job` field.
 /// This will poison the relevant query if dropped.
 pub(super) struct JobOwner<'a, 'tcx: 'a, Q: QueryDescription<'tcx> + 'a> {
-    map: &'a Lock<QueryMap<'tcx, Q>>,
+    tcx: TyCtxt<'a, 'tcx, 'tcx>,
     key: Q::Key,
     job: Lrc<QueryJob<'tcx>>,
 }
@@ -133,16 +123,7 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
                 Entry::Occupied(entry) => {
                     match *entry.get() {
                         QueryResult::Started(ref job) => job.clone(),
-                        QueryResult::Poisoned => {
-                                #[cfg(not(parallel_queries))]
-                                {
-                                    FatalError.raise();
-                                }
-                                #[cfg(parallel_queries)]
-                                {
-                                    panic::resume_unwind(Box::new(rayon_core::PoisonedJob))
-                                }
-                            },
+                        QueryResult::Poisoned => FatalError.raise(),
                     }
                 }
                 Entry::Vacant(entry) => {
@@ -154,7 +135,7 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
                         };
                         let job = Lrc::new(QueryJob::new(info, icx.query.clone()));
                         let owner = JobOwner {
-                            map,
+                            tcx: tcx.global_tcx(),
                             job: job.clone(),
                             key: (*key).clone(),
                         };
@@ -177,10 +158,12 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
         // We can move out of `self` here because we `mem::forget` it below
         let key = unsafe { ptr::read(&self.key) };
         let job = unsafe { ptr::read(&self.job) };
-        let map = self.map;
+        let tcx = self.tcx;
 
         // Forget ourself so our destructor won't poison the query
         mem::forget(self);
+
+        let map = Q::query_map(tcx);
 
         let value = QueryValue::new(result.clone(), dep_node_index);
         {
@@ -189,7 +172,7 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
             lock.results.insert(key, value);
         }
 
-        job.signal_complete();
+        job.signal_complete(tcx);
     }
 
     /// Executes a job by changing the ImplicitCtxt to point to the
@@ -213,7 +196,6 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
                 query: Some(self.job.clone()),
                 layout_depth: current_icx.layout_depth,
                 task: current_icx.task,
-                waiter_cycle: None,
             };
 
             // Use the ImplicitCtxt while we execute the query
@@ -231,11 +213,12 @@ impl<'a, 'tcx, Q: QueryDescription<'tcx>> JobOwner<'a, 'tcx, Q> {
 
 impl<'a, 'tcx, Q: QueryDescription<'tcx>> Drop for JobOwner<'a, 'tcx, Q> {
     fn drop(&mut self) {
+        let map = Q::query_map(self.tcx);
         // Poison the query so jobs waiting on it panic
-        self.map.borrow_mut().active.insert(self.key.clone(), QueryResult::Poisoned);
+        map.borrow_mut().active.insert(self.key.clone(), QueryResult::Poisoned);
         // Also signal the completion of the job, so waiters
         // will continue execution
-        self.job.signal_complete();
+        self.job.signal_complete(self.tcx);
     }
 }
 

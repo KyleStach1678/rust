@@ -89,13 +89,13 @@ extern crate libc;
 extern crate rustc_target;
 #[macro_use] extern crate rustc_data_structures;
 extern crate serialize;
+extern crate parking_lot;
 extern crate rustc_errors as errors;
 extern crate rustc_rayon as rayon;
 extern crate rustc_rayon_core as rayon_core;
 #[macro_use] extern crate log;
 #[macro_use] extern crate syntax;
 extern crate syntax_pos;
-#[macro_use] extern crate scoped_tls;
 extern crate jobserver;
 extern crate proc_macro;
 

@@ -66,6 +66,7 @@ use std::hash::{Hash, Hasher};
 use std::mem;
 use std::ops::Deref;
 use std::iter;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::Arc;
 use rustc_target::spec::abi;
@@ -858,6 +859,9 @@ pub struct GlobalCtxt<'tcx> {
 
     pub dep_graph: DepGraph,
 
+    /// Used to detect query cycles by detecting deadlocks
+    pub active_threads: AtomicUsize,
+
     /// This provides access to the incr. comp. on-disk cache for query results.
     /// Do not access this directly. It is only meant to be used by
     /// `DepGraph::try_mark_green()` and the query infrastructure in `ty::maps`.
@@ -1258,6 +1262,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             cstore,
             global_arenas: &arenas.global,
             global_interners: interners,
+            active_threads: AtomicUsize::new(s.query_threads()),
             dep_graph: dep_graph.clone(),
             on_disk_query_result_cache,
             types: common_types,
@@ -1570,7 +1575,6 @@ impl<'gcx: 'tcx, 'tcx> GlobalCtxt<'gcx> {
                 query: icx.query.clone(),
                 layout_depth: icx.layout_depth,
                 task: icx.task,
-                waiter_cycle: None,
             };
             ty::tls::enter_context(&new_icx, |new_icx| {
                 f(new_icx.tcx)
@@ -1747,14 +1751,12 @@ pub mod tls {
     use std::fmt;
     use std::mem;
     use syntax_pos;
-    use syntax_pos::Span;
     use ty::maps;
-    use ty::maps::CycleError;
     use errors::{Diagnostic, TRACK_DIAGNOSTICS};
     use rustc_data_structures::OnDrop;
     use rayon_core;
     use dep_graph::OpenTask;
-    use rustc_data_structures::sync::{self, Lrc, Lock};
+    use rustc_data_structures::sync::{self, Lrc};
 
     /// This is the implicit state of rustc. It contains the current
     /// TyCtxt and query. It is updated when creating a local interner or
@@ -1777,18 +1779,16 @@ pub mod tls {
         /// The current dep graph task. This is used to add dependencies to queries
         /// when executing them
         pub task: &'a OpenTask,
-
-        pub waiter_cycle: Option<&'a (Span, Lock<Option<CycleError<'gcx>>>)>,
     }
 
     #[cfg(parallel_queries)]
     fn set_tlv<F: FnOnce() -> R, R>(value: usize, f: F) -> R {
-        rayon_core::fiber::tlv::set(value, f)
+        rayon_core::tlv::with(value, f)
     }
 
     #[cfg(parallel_queries)]
     fn get_tlv() -> usize {
-        rayon_core::fiber::tlv::get()
+        rayon_core::tlv::get()
     }
 
     // A thread local value which stores a pointer to the current ImplicitCtxt
@@ -1872,13 +1872,6 @@ pub mod tls {
         where F: for<'a> FnOnce(TyCtxt<'a, 'gcx, 'gcx>) -> R
     {
         with_thread_locals(|| {
-            GCX_PTR.with(|lock| {
-                *lock.lock() = gcx as *const _ as usize;
-            });
-            let _on_drop = OnDrop(move || {
-                GCX_PTR.with(|lock| *lock.lock() = 0);
-            });
-
             let tcx = TyCtxt {
                 gcx,
                 interners: &gcx.global_interners,
@@ -1888,32 +1881,11 @@ pub mod tls {
                 query: None,
                 layout_depth: 0,
                 task: &OpenTask::Ignore,
-                waiter_cycle: None,
             };
             enter_context(&icx, |_| {
                 f(tcx)
             })
         })
-    }
-
-    scoped_thread_local!(pub static GCX_PTR: Lock<usize>);
-
-    pub unsafe fn with_global_query<F, R>(f: F) -> R
-        where F: for<'a, 'gcx, 'tcx> FnOnce(TyCtxt<'a, 'gcx, 'tcx>) -> R
-    {
-        let gcx = &*(GCX_PTR.with(|lock| *lock.lock()) as *const GlobalCtxt<'static>);
-        let tcx = TyCtxt {
-            gcx,
-            interners: &gcx.global_interners,
-        };
-        let icx = ImplicitCtxt {
-            query: None,
-            tcx,
-            layout_depth: 0,
-            task: &OpenTask::Ignore,
-            waiter_cycle: None,
-        };
-        enter_context(&icx, |_| f(tcx))
     }
 
     /// Allows access to the current ImplicitCtxt in a closure if one is available

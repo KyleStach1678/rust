@@ -49,7 +49,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::iter;
 use std::path::{Path, PathBuf};
-use rustc_data_structures::sync::{self, Lrc, Lock};
+use rustc_data_structures::sync::{self, Lrc};
 use std::sync::mpsc;
 use syntax::{self, ast, attr, diagnostics, visit};
 use syntax::ext::base::ExtCtxt;
@@ -69,9 +69,7 @@ pub fn spawn_thread_pool<F: FnOnce(config::Options) -> R + sync::Send, R: sync::
     opts: config::Options,
     f: F
 ) -> R {
-    ty::tls::GCX_PTR.set(&Lock::new(0), || {
-        f(opts)
-    })
+    f(opts)
 }
 
 #[cfg(parallel_queries)]
@@ -81,13 +79,10 @@ pub fn spawn_thread_pool<F: FnOnce(config::Options) -> R + sync::Send, R: sync::
 ) -> R {
     use syntax;
     use syntax_pos;
-    use rayon::{Configuration, ThreadPool};
+    use rayon::{ThreadPoolBuilder, ThreadPool};
 
-    let gcx_ptr = &Lock::new(0);
-
-    let config = Configuration::new().num_threads(Session::query_threads_from_opts(&opts))
-                                     .deadlock_handler(ty::maps::deadlock)
-                                     .stack_size(16 * 1024 * 1024);
+    let config = ThreadPoolBuilder::new().num_threads(Session::query_threads_from_opts(&opts))
+                                         .stack_size(16 * 1024 * 1024);
 
     let with_pool = move |pool: &ThreadPool| {
         pool.install(move || f(opts))
@@ -103,9 +98,7 @@ pub fn spawn_thread_pool<F: FnOnce(config::Options) -> R + sync::Send, R: sync::
                 syntax::GLOBALS.set(syntax_globals, || {
                     syntax_pos::GLOBALS.set(syntax_pos_globals, || {
                         ty::tls::with_thread_locals(|| {
-                            ty::tls::GCX_PTR.set(gcx_ptr, || {
-                                worker()
-                            })
+                            worker()
                         })
                     })
                 })
