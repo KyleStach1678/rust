@@ -1756,7 +1756,7 @@ pub mod tls {
     use rustc_data_structures::OnDrop;
     use rayon_core;
     use dep_graph::OpenTask;
-    use rustc_data_structures::sync::{self, Lrc};
+    use rustc_data_structures::sync::{self, Lrc, Lock};
 
     /// This is the implicit state of rustc. It contains the current
     /// TyCtxt and query. It is updated when creating a local interner or
@@ -1872,6 +1872,13 @@ pub mod tls {
         where F: for<'a> FnOnce(TyCtxt<'a, 'gcx, 'gcx>) -> R
     {
         with_thread_locals(|| {
+            GCX_PTR.with(|lock| {
+                *lock.lock() = gcx as *const _ as usize;
+            });
+            let _on_drop = OnDrop(move || {
+                GCX_PTR.with(|lock| *lock.lock() = 0);
+            });
+
             let tcx = TyCtxt {
                 gcx,
                 interners: &gcx.global_interners,
@@ -1886,6 +1893,25 @@ pub mod tls {
                 f(tcx)
             })
         })
+    }
+
+    scoped_thread_local!(pub static GCX_PTR: Lock<usize>);
+
+    pub unsafe fn with_global<F, R>(f: F) -> R
+        where F: for<'a, 'gcx, 'tcx> FnOnce(TyCtxt<'a, 'gcx, 'tcx>) -> R
+    {
+        let gcx = &*(GCX_PTR.with(|lock| *lock.lock()) as *const GlobalCtxt<'_>);
+        let tcx = TyCtxt {
+            gcx,
+            interners: &gcx.global_interners,
+        };
+        let icx = ImplicitCtxt {
+            query: None,
+            tcx,
+            layout_depth: 0,
+            task: &OpenTask::Ignore,
+        };
+        enter_context(&icx, |_| f(tcx))
     }
 
     /// Allows access to the current ImplicitCtxt in a closure if one is available

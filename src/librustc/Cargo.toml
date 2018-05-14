@@ -15,6 +15,7 @@ fmt_macros = { path = "../libfmt_macros" }
 graphviz = { path = "../libgraphviz" }
 jobserver = "0.1"
 lazy_static = "1.0.0"
+scoped-tls = { version = "0.1.1", features = ["nightly"] }
 log = { version = "0.4", features = ["release_max_level_info", "std"] }
 proc_macro = { path = "../libproc_macro" }
 rustc-rayon-core = { git = "https://github.com/Zoxc/rayon.git", branch = "rustc" }

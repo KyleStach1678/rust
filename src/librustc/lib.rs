@@ -84,6 +84,7 @@ extern crate fmt_macros;
 extern crate getopts;
 extern crate graphviz;
 #[macro_use] extern crate lazy_static;
+#[macro_use] extern crate scoped_tls;
 #[cfg(windows)]
 extern crate libc;
 extern crate rustc_target;

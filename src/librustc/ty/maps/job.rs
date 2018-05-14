@@ -24,6 +24,7 @@ use std::fmt;
 use std::collections::HashSet;
 #[cfg(parallel_queries)]
 use {
+    rayon_core,
     parking_lot::{Mutex, Condvar},
     std::sync::atomic::Ordering,
     std::thread,
@@ -172,6 +173,7 @@ impl<'a, 'tcx> QueryWaiter<'a, 'tcx> {
             ::std::thread::current().id(),
             tcx.active_threads.load(Ordering::SeqCst),
             &self.condvar as *const _ as usize);
+        rayon_core::unblock();
         self.condvar.notify_one();
     }
 }
@@ -207,14 +209,17 @@ impl QueryLatch {
                 info.waiters.push(mem::transmute(waiter));
             }
             if tcx.active_threads.fetch_sub(1, Ordering::SeqCst) == 1 {
+                /*
                 // We are the last active thread, waiting here would cause a deadlock.
                 // Spawn a thread to handle the deadlock before we go to sleep
                 handle_deadlock(tcx);
+                */
             }
             eprintln!("[{:?}] (await) active threads: {} condvar: {:x}",
                 ::std::thread::current().id(),
                 tcx.active_threads.load(Ordering::SeqCst),
                 &waiter.condvar as *const _ as usize);
+            rayon_core::block();
             waiter.condvar.wait(&mut info);
         }
     }
@@ -442,25 +447,32 @@ fn remove_cycle<'tcx>(
 }
 
 #[cfg(parallel_queries)]
-fn handle_deadlock(tcx: TyCtxt<'_, '_, '_>) {
+pub fn handle_deadlock() {
     use syntax;
     use syntax_pos;
+
+    let gcx_ptr = tls::GCX_PTR.with(|gcx_ptr| {
+        gcx_ptr as *const _
+    });
+    let gcx_ptr = unsafe { &*gcx_ptr };
 
     let syntax_globals = syntax::GLOBALS.with(|syntax_globals| {
         syntax_globals as *const _
     });
     let syntax_globals = unsafe { &*syntax_globals };
+
     let syntax_pos_globals = syntax_pos::GLOBALS.with(|syntax_pos_globals| {
         syntax_pos_globals as *const _
     });
     let syntax_pos_globals = unsafe { &*syntax_pos_globals };
-    let tcx: TyCtxt<'static, 'static, 'static> = unsafe { mem::transmute(tcx) };
     thread::spawn(move || {
-        syntax::GLOBALS.set(syntax_globals, || {
+        tls::GCX_PTR.set(gcx_ptr, || {
             syntax_pos::GLOBALS.set(syntax_pos_globals, || {
-                tls::with_thread_locals(|| {
-                    tls::enter_global(&*tcx, |_| {
-                        deadlock(tcx)
+                syntax_pos::GLOBALS.set(syntax_pos_globals, || {
+                    tls::with_thread_locals(|| {
+                        unsafe {
+                            tls::with_global(|tcx| deadlock(tcx))
+                        }
                     })
                 })
             })
