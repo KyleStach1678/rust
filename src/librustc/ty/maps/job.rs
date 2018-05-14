@@ -167,13 +167,13 @@ struct QueryWaiter<'a, 'tcx: 'a> {
 
 #[cfg(parallel_queries)]
 impl<'a, 'tcx> QueryWaiter<'a, 'tcx> {
-    fn notify(&self, tcx: TyCtxt<'_, '_, '_>) {
+    fn notify(&self, tcx: TyCtxt<'_, '_, '_>, registry: &rayon_core::Registry) {
         tcx.active_threads.fetch_add(1, Ordering::SeqCst);
         eprintln!("[{:?}] (wake) active threads: {}  condvar: {:x}",
             ::std::thread::current().id(),
             tcx.active_threads.load(Ordering::SeqCst),
             &self.condvar as *const _ as usize);
-        rayon_core::unblock();
+        rayon_core::unblock(registry);
         self.condvar.notify_one();
     }
 }
@@ -228,8 +228,9 @@ impl QueryLatch {
         let mut info = self.info.lock();
         debug_assert!(!info.complete);
         info.complete = true;
+        let registry = rayon_core::Registry::current();
         for waiter in info.waiters.drain(..) {
-            waiter.notify(tcx);
+            waiter.notify(tcx, &registry);
         }
     }
 
@@ -451,6 +452,8 @@ pub fn handle_deadlock() {
     use syntax;
     use syntax_pos;
 
+    let registry = rayon_core::Registry::current();
+
     let gcx_ptr = tls::GCX_PTR.with(|gcx_ptr| {
         gcx_ptr as *const _
     });
@@ -471,7 +474,7 @@ pub fn handle_deadlock() {
                 syntax_pos::GLOBALS.set(syntax_pos_globals, || {
                     tls::with_thread_locals(|| {
                         unsafe {
-                            tls::with_global(|tcx| deadlock(tcx))
+                            tls::with_global(|tcx| deadlock(tcx, &registry))
                         }
                     })
                 })
@@ -481,7 +484,7 @@ pub fn handle_deadlock() {
 }
 
 #[cfg(parallel_queries)]
-fn deadlock(tcx: TyCtxt<'_, '_, '_>) {
+fn deadlock(tcx: TyCtxt<'_, '_, '_>, registry: &rayon_core::Registry) {
     let on_panic = OnDrop(|| {
         eprintln!("deadlock handler panicked, aborting process");
         process::abort();
@@ -514,7 +517,7 @@ fn deadlock(tcx: TyCtxt<'_, '_, '_>) {
 
     // FIXME: Ensure this won't cause a deadlock before we return
     for waiter in wakelist.into_iter() {
-        waiter.notify(tcx);
+        waiter.notify(tcx, registry);
     }
 
     //eprintln!("aborting due to deadlock");
