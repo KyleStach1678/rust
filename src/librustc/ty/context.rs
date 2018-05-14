@@ -1900,7 +1900,9 @@ pub mod tls {
     pub unsafe fn with_global<F, R>(f: F) -> R
         where F: for<'a, 'gcx, 'tcx> FnOnce(TyCtxt<'a, 'gcx, 'tcx>) -> R
     {
-        let gcx = &*(GCX_PTR.with(|lock| *lock.lock()) as *const GlobalCtxt<'_>);
+        let gcx = GCX_PTR.with(|lock| *lock.lock());
+        assert!(gcx != 0);
+        let gcx = &*(gcx as *const GlobalCtxt<'_>);
         let tcx = TyCtxt {
             gcx,
             interners: &gcx.global_interners,
