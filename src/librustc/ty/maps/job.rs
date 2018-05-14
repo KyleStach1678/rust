@@ -98,10 +98,10 @@ impl<'tcx> QueryJob<'tcx> {
                     cycle: None,
                     condvar: Condvar::new(),
                 };
-                eprintln!("[{:?}] await query {:?} condvar: {:x}",
+                /*eprintln!("[{:?}] await query {:?} condvar: {:x}",
                     ::std::thread::current().id(),
                     self.info.query,
-                    &waiter.condvar as *const _ as usize);
+                    &waiter.condvar as *const _ as usize);*/
                 self.latch.await(tcx, &mut waiter);
 
                 match waiter.cycle {
@@ -149,9 +149,9 @@ impl<'tcx> QueryJob<'tcx> {
     /// This does nothing for single threaded rustc,
     /// as there are no concurrent jobs which could be waiting on us
     pub fn signal_complete(&self, tcx: TyCtxt<'_, 'tcx, '_>) {
-        eprintln!("[{:?}] complete query {:?}",
+        /*eprintln!("[{:?}] complete query {:?}",
             ::std::thread::current().id(),
-            self.info.query);
+            self.info.query);*/
         #[cfg(parallel_queries)]
         self.latch.set(tcx);
     }
@@ -168,11 +168,11 @@ struct QueryWaiter<'a, 'tcx: 'a> {
 #[cfg(parallel_queries)]
 impl<'a, 'tcx> QueryWaiter<'a, 'tcx> {
     fn notify(&self, tcx: TyCtxt<'_, '_, '_>, registry: &rayon_core::Registry) {
-        tcx.active_threads.fetch_add(1, Ordering::SeqCst);
+        /*tcx.active_threads.fetch_add(1, Ordering::SeqCst);
         eprintln!("[{:?}] (wake) active threads: {}  condvar: {:x}",
             ::std::thread::current().id(),
             tcx.active_threads.load(Ordering::SeqCst),
-            &self.condvar as *const _ as usize);
+            &self.condvar as *const _ as usize);*/
         rayon_core::unblock(registry);
         self.condvar.notify_one();
     }
@@ -208,7 +208,7 @@ impl QueryLatch {
                 #[allow(mutable_transmutes)]
                 info.waiters.push(mem::transmute(waiter));
             }
-            if tcx.active_threads.fetch_sub(1, Ordering::SeqCst) == 1 {
+            /*if tcx.active_threads.fetch_sub(1, Ordering::SeqCst) == 1 {
                 /*
                 // We are the last active thread, waiting here would cause a deadlock.
                 // Spawn a thread to handle the deadlock before we go to sleep
@@ -218,7 +218,7 @@ impl QueryLatch {
             eprintln!("[{:?}] (await) active threads: {} condvar: {:x}",
                 ::std::thread::current().id(),
                 tcx.active_threads.load(Ordering::SeqCst),
-                &waiter.condvar as *const _ as usize);
+                &waiter.condvar as *const _ as usize);*/
             rayon_core::block();
             waiter.condvar.wait(&mut info);
         }
