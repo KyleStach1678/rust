@@ -97,6 +97,10 @@ impl<'tcx> QueryJob<'tcx> {
                     cycle: None,
                     condvar: Condvar::new(),
                 };
+                eprintln!("[{:?}] await query {:?} condvar: {:x}",
+                    ::std::thread::current().id(),
+                    self.info.query,
+                    &waiter.condvar as *const _ as usize);
                 self.latch.await(tcx, &mut waiter);
 
                 match waiter.cycle {
@@ -144,6 +148,9 @@ impl<'tcx> QueryJob<'tcx> {
     /// This does nothing for single threaded rustc,
     /// as there are no concurrent jobs which could be waiting on us
     pub fn signal_complete(&self, tcx: TyCtxt<'_, 'tcx, '_>) {
+        eprintln!("[{:?}] complete query {:?}",
+            ::std::thread::current().id(),
+            self.info.query);
         #[cfg(parallel_queries)]
         self.latch.set(tcx);
     }
@@ -161,6 +168,10 @@ struct QueryWaiter<'a, 'tcx: 'a> {
 impl<'a, 'tcx> QueryWaiter<'a, 'tcx> {
     fn notify(&self, tcx: TyCtxt<'_, '_, '_>) {
         tcx.active_threads.fetch_add(1, Ordering::SeqCst);
+        eprintln!("[{:?}] (wake) active threads: {}  condvar: {:x}",
+            ::std::thread::current().id(),
+            tcx.active_threads.load(Ordering::SeqCst),
+            &self.condvar as *const _ as usize);
         self.condvar.notify_one();
     }
 }
@@ -200,6 +211,10 @@ impl QueryLatch {
                 // Spawn a thread to handle the deadlock before we go to sleep
                 handle_deadlock(tcx);
             }
+            eprintln!("[{:?}] (await) active threads: {} condvar: {:x}",
+                ::std::thread::current().id(),
+                tcx.active_threads.load(Ordering::SeqCst),
+                &waiter.condvar as *const _ as usize);
             waiter.condvar.wait(&mut info);
         }
     }
