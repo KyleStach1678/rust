@@ -61,6 +61,7 @@ pub struct QueryJob<'tcx> {
     /// Diagnostic messages which are emitted while the query executes
     pub diagnostics: Lock<Vec<Diagnostic>>,
 
+    #[cfg(parallel_queries)]
     latch: QueryLatch,
 }
 
@@ -71,6 +72,7 @@ impl<'tcx> QueryJob<'tcx> {
             diagnostics: Lock::new(Vec::new()),
             info,
             parent,
+            #[cfg(parallel_queries)]
             latch: QueryLatch::new(),
         }
     }

@@ -66,7 +66,9 @@ use self::plumbing::*;
 pub use self::plumbing::{force_from_dep_node, CycleError};
 
 mod job;
-pub use self::job::{QueryJob, QueryInfo, handle_deadlock};
+pub use self::job::{QueryJob, QueryInfo};
+#[cfg(parallel_queries)]
+pub use self::job::handle_deadlock;
 
 mod keys;
 pub use self::keys::Key;
