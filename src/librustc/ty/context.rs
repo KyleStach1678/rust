@@ -57,7 +57,7 @@ use rustc_data_structures::stable_hasher::{HashStable, hash_stable_hashmap,
                                            StableVec};
 use arena::{TypedArena, SyncDroplessArena};
 use rustc_data_structures::indexed_vec::IndexVec;
-use rustc_data_structures::sync::{Lrc, Lock};
+use rustc_data_structures::sync::{Lrc, Lock, WorkerLocal};
 use std::any::Any;
 use std::borrow::Borrow;
 use std::cmp::Ordering;
@@ -66,6 +66,7 @@ use std::hash::{Hash, Hasher};
 use std::mem;
 use std::ops::Deref;
 use std::iter;
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::Arc;
 use rustc_target::spec::abi;
@@ -79,14 +80,14 @@ use syntax_pos::Span;
 use hir;
 
 pub struct AllArenas<'tcx> {
-    pub global: GlobalArenas<'tcx>,
+    pub global: WorkerLocal<GlobalArenas<'tcx>>,
     pub interner: SyncDroplessArena,
 }
 
 impl<'tcx> AllArenas<'tcx> {
     pub fn new() -> Self {
         AllArenas {
-            global: GlobalArenas::new(),
+            global: WorkerLocal::new(|_| GlobalArenas::new()),
             interner: SyncDroplessArena::new(),
         }
     }
@@ -849,7 +850,7 @@ impl<'a, 'gcx, 'tcx> Deref for TyCtxt<'a, 'gcx, 'tcx> {
 }
 
 pub struct GlobalCtxt<'tcx> {
-    global_arenas: &'tcx GlobalArenas<'tcx>,
+    global_arenas: &'tcx WorkerLocal<GlobalArenas<'tcx>>,
     global_interners: CtxtInterners<'tcx>,
 
     cstore: &'tcx CrateStoreDyn,
@@ -857,6 +858,9 @@ pub struct GlobalCtxt<'tcx> {
     pub sess: &'tcx Session,
 
     pub dep_graph: DepGraph,
+
+    /// Used to detect query cycles by detecting deadlocks
+    pub active_threads: AtomicUsize,
 
     /// This provides access to the incr. comp. on-disk cache for query results.
     /// Do not access this directly. It is only meant to be used by
@@ -1258,6 +1262,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             cstore,
             global_arenas: &arenas.global,
             global_interners: interners,
+            active_threads: AtomicUsize::new(s.query_threads()),
             dep_graph: dep_graph.clone(),
             on_disk_query_result_cache,
             types: common_types,
@@ -1741,6 +1746,7 @@ impl<'a, 'tcx> Lift<'tcx> for &'a Slice<CanonicalVarInfo> {
 pub mod tls {
     use super::{GlobalCtxt, TyCtxt};
 
+    #[cfg(not(parallel_queries))]
     use std::cell::Cell;
     use std::fmt;
     use std::mem;
@@ -1748,8 +1754,9 @@ pub mod tls {
     use ty::maps;
     use errors::{Diagnostic, TRACK_DIAGNOSTICS};
     use rustc_data_structures::OnDrop;
-    use rustc_data_structures::sync::Lrc;
+    use rayon_core;
     use dep_graph::OpenTask;
+    use rustc_data_structures::sync::{self, Lrc, Lock};
 
     /// This is the implicit state of rustc. It contains the current
     /// TyCtxt and query. It is updated when creating a local interner or
@@ -1774,9 +1781,21 @@ pub mod tls {
         pub task: &'a OpenTask,
     }
 
+    #[cfg(parallel_queries)]
+    fn set_tlv<F: FnOnce() -> R, R>(value: usize, f: F) -> R {
+        rayon_core::tlv::with(value, f)
+    }
+
+    #[cfg(parallel_queries)]
+    fn get_tlv() -> usize {
+        rayon_core::tlv::get()
+    }
+
     // A thread local value which stores a pointer to the current ImplicitCtxt
+    #[cfg(not(parallel_queries))]
     thread_local!(static TLV: Cell<usize> = Cell::new(0));
 
+    #[cfg(not(parallel_queries))]
     fn set_tlv<F: FnOnce() -> R, R>(value: usize, f: F) -> R {
         let old = get_tlv();
         let _reset = OnDrop(move || TLV.with(|tlv| tlv.set(old)));
@@ -1784,6 +1803,7 @@ pub mod tls {
         f()
     }
 
+    #[cfg(not(parallel_queries))]
     fn get_tlv() -> usize {
         TLV.with(|tlv| tlv.get())
     }
@@ -1852,6 +1872,13 @@ pub mod tls {
         where F: for<'a> FnOnce(TyCtxt<'a, 'gcx, 'gcx>) -> R
     {
         with_thread_locals(|| {
+            GCX_PTR.with(|lock| {
+                *lock.lock() = gcx as *const _ as usize;
+            });
+            let _on_drop = OnDrop(move || {
+                GCX_PTR.with(|lock| *lock.lock() = 0);
+            });
+
             let tcx = TyCtxt {
                 gcx,
                 interners: &gcx.global_interners,
@@ -1868,6 +1895,27 @@ pub mod tls {
         })
     }
 
+    scoped_thread_local!(pub static GCX_PTR: Lock<usize>);
+
+    pub unsafe fn with_global<F, R>(f: F) -> R
+        where F: for<'a, 'gcx, 'tcx> FnOnce(TyCtxt<'a, 'gcx, 'tcx>) -> R
+    {
+        let gcx = GCX_PTR.with(|lock| *lock.lock());
+        assert!(gcx != 0);
+        let gcx = &*(gcx as *const GlobalCtxt<'_>);
+        let tcx = TyCtxt {
+            gcx,
+            interners: &gcx.global_interners,
+        };
+        let icx = ImplicitCtxt {
+            query: None,
+            tcx,
+            layout_depth: 0,
+            task: &OpenTask::Ignore,
+        };
+        enter_context(&icx, |_| f(tcx))
+    }
+
     /// Allows access to the current ImplicitCtxt in a closure if one is available
     pub fn with_context_opt<F, R>(f: F) -> R
         where F: for<'a, 'gcx, 'tcx> FnOnce(Option<&ImplicitCtxt<'a, 'gcx, 'tcx>>) -> R
@@ -1876,6 +1924,10 @@ pub mod tls {
         if context == 0 {
             f(None)
         } else {
+            // We could get a ImplicitCtxt pointer from another thread.
+            // Ensure that ImplicitCtxt is Sync
+            sync::assert_sync::<ImplicitCtxt>();
+
             unsafe { f(Some(&*(context as *const ImplicitCtxt))) }
         }
     }
